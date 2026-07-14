@@ -29,9 +29,11 @@ import {
   commitTaskDeletion,
   clearTasks as dbClearTasks,
   getAllAgentConversations,
+  putAgentConversation as dbPutAgentConversation,
   replaceAgentConversations,
   clearAgentConversations as dbClearAgentConversations,
   getImage,
+  getStoredImageThumbnail,
   getImageThumbnail,
   getAllImageIds,
   putImage,
@@ -661,12 +663,37 @@ function isImageReferencedByState(state: AppState, imageId: string) {
 }
 
 export async function deleteImageIfUnreferenced(imageId: string) {
-  deleteImageCacheEntry(imageId)
   if (isImageReferencedByState(useStore.getState(), imageId)) return
   try {
-    await deleteImage(imageId)
+    await deleteStoredImageIfUnreferenced(imageId)
   } catch {
     // 清理是内存/存储优化，失败不影响替换结果。
+  }
+}
+
+async function deleteStoredImageIfUnreferenced(imageId: string) {
+  if (isImageReferencedByState(useStore.getState(), imageId)) return
+  const [image, thumbnail] = await Promise.all([getImage(imageId), getStoredImageThumbnail(imageId)])
+  if (isImageReferencedByState(useStore.getState(), imageId)) return
+
+  await deleteImage(imageId)
+  if (!isImageReferencedByState(useStore.getState(), imageId)) {
+    deleteImageCacheEntry(imageId)
+    return
+  }
+
+  if (image) {
+    await putImage(image)
+    cacheImage(image.id, image.dataUrl)
+  }
+  if (thumbnail) {
+    await putImageThumbnail(thumbnail)
+    cacheThumbnail(thumbnail.id, {
+      dataUrl: thumbnail.thumbnailDataUrl,
+      width: thumbnail.width,
+      height: thumbnail.height,
+      thumbnailVersion: thumbnail.thumbnailVersion,
+    })
   }
 }
 
@@ -2476,9 +2503,7 @@ async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
 
   for (const imgId of candidates) {
     if (stillUsed.has(imgId)) continue
-    if (isImageReferencedByState(useStore.getState(), imgId)) continue
-    await deleteImage(imgId)
-    deleteImageCacheEntry(imgId)
+    await deleteStoredImageIfUnreferenced(imgId)
   }
 }
 
@@ -2653,7 +2678,13 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
       .map((task) => task.agentToolCallId!),
   )
   const tasksById = new Map(roundTasks.map((task) => [task.id, task]))
-  const deletedBatchIndexes = new Map<string, Set<number>>()
+  const batchItemIdsByCallId = new Map<string, string[]>()
+  for (const item of output) {
+    if (item.type !== 'function_call' || item.name !== 'generate_image_batch' || !item.call_id) continue
+    const batchItems = parseBatchImageCallArguments(item.arguments ?? '')
+    if (batchItems) batchItemIdsByCallId.set(item.call_id, batchItems.map((batchItem) => batchItem.id))
+  }
+  const deletedBatchItemIds = new Map<string, Set<string>>()
   for (const batchCallId of new Set(deletedTasks.map((task) => task.agentBatchCallId).filter((id): id is string => Boolean(id)))) {
     const batchTasks = round.outputTaskIds
       .map((taskId) => tasksById.get(taskId))
@@ -2662,7 +2693,15 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
       removedFunctionCallIds.add(batchCallId)
       continue
     }
-    deletedBatchIndexes.set(batchCallId, new Set(batchTasks.flatMap((task, index) => deletedTaskIds.has(task.id) ? [index] : [])))
+    const batchItemIds = batchItemIdsByCallId.get(batchCallId) ?? []
+    const ids = new Set<string>()
+    for (let index = 0; index < batchTasks.length; index++) {
+      const task = batchTasks[index]
+      if (!deletedTaskIds.has(task.id)) continue
+      const itemId = batchItemIds.length === batchTasks.length ? batchItemIds[index] : task.agentBatchItemId
+      if (itemId) ids.add(itemId)
+    }
+    if (ids.size > 0) deletedBatchItemIds.set(batchCallId, ids)
   }
 
   let imageIndex = 0
@@ -2686,8 +2725,8 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
       continue
     }
 
-    const indexes = callId ? deletedBatchIndexes.get(callId) : undefined
-    if (!indexes?.size || (item.type !== 'function_call' && item.type !== 'function_call_output')) {
+    const itemIds = callId ? deletedBatchItemIds.get(callId) : undefined
+    if (!itemIds?.size || (item.type !== 'function_call' && item.type !== 'function_call_output')) {
       scrubbed.push(item)
       continue
     }
@@ -2699,8 +2738,13 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
         scrubbed.push(item)
         continue
       }
+      const images = parsed.images.filter((image) => !isRecord(image) || typeof image.id !== 'string' || !itemIds.has(image.id))
+      if (images.length === parsed.images.length) {
+        scrubbed.push(item)
+        continue
+      }
       changed = true
-      scrubbed.push({ ...item, [field]: JSON.stringify({ ...parsed, images: parsed.images.filter((_, index) => !indexes.has(index)) }) })
+      scrubbed.push({ ...item, [field]: JSON.stringify({ ...parsed, images }) })
     } catch {
       scrubbed.push(item)
     }
@@ -2731,9 +2775,10 @@ function scrubAgentOutputPayloadsForDeletedTasks(deletedTasks: TaskRecord[]) {
     deletedByRound.set(key, [...(deletedByRound.get(key) ?? []), task])
     affectedConversationIds.add(task.agentConversationId)
   }
-  if (deletedByRound.size === 0) return []
+  if (deletedByRound.size === 0) return { updatedTasks: [], updatedConversations: [] }
 
   const updatedTasks: TaskRecord[] = []
+  const updatedConversations: AgentConversation[] = []
   useStore.setState((state) => {
     const tasksByRound = new Map<string, TaskRecord[]>()
     for (const task of [...state.tasks, ...deletedTasks]) {
@@ -2760,7 +2805,9 @@ function scrubAgentOutputPayloadsForDeletedTasks(deletedTasks: TaskRecord[]) {
       })
       if (!changed) return conversation
       conversationsChanged = true
-      return { ...conversation, rounds }
+      const updated = { ...conversation, rounds }
+      updatedConversations.push(updated)
+      return updated
     })
     const tasks = state.tasks.map((task) => {
       if (!task.agentConversationId || !task.agentRoundId) return task
@@ -2780,7 +2827,22 @@ function scrubAgentOutputPayloadsForDeletedTasks(deletedTasks: TaskRecord[]) {
       ...(updatedTasks.length > 0 ? { tasks } : {}),
     }
   })
-  return updatedTasks
+  return { updatedTasks, updatedConversations }
+}
+
+async function persistTaskDeletionCleanup(deletedTaskIds: string[], cleanup: ReturnType<typeof scrubAgentOutputPayloadsForDeletedTasks>) {
+  const tasks = cleanup.updatedTasks.map(getPersistableTask)
+  const conversations = cleanup.updatedConversations.map(getPersistableAgentConversation)
+  try {
+    await commitTaskDeletion(deletedTaskIds, tasks, conversations)
+  } catch (err) {
+    console.warn('原子清理任务关联数据失败，改用逐项持久化', err)
+    await Promise.all([
+      ...deletedTaskIds.map((taskId) => dbDeleteTask(taskId)),
+      ...tasks.map((task) => dbPutTask(task)),
+      ...conversations.map((conversation) => dbPutAgentConversation(conversation)),
+    ])
+  }
 }
 
 function sanitizeResponseOutputForInput(output: ResponsesOutputItem[], options: { allowPendingFunctionCalls?: boolean } = {}) {
@@ -3455,6 +3517,9 @@ async function executeAgentRound(
       }
       return deletedTasks
     }
+    const getLatestRound = () => useStore.getState().agentConversations
+      .find((item) => item.id === conversationId)
+      ?.rounds.find((item) => item.id === roundId)
 
     const attachTaskToAgentRound = (taskId: string) => {
       if (streamingTaskIds.includes(taskId)) return
@@ -3479,7 +3544,7 @@ async function executeAgentRound(
       toolCallId: string,
       taskPrompt = '',
       inputImageIds = round.inputImageIds ?? [],
-      options: { createdAt?: number; agentBatchCallId?: string; maskTargetImageId?: string | null; maskImageId?: string | null; taskParams?: TaskParams } = {},
+      options: { createdAt?: number; agentBatchCallId?: string; agentBatchItemId?: string; maskTargetImageId?: string | null; maskImageId?: string | null; taskParams?: TaskParams } = {},
     ) => {
       const existingTaskId = taskIdByToolCallId.get(toolCallId)
       if (existingTaskId) return existingTaskId
@@ -3516,6 +3581,7 @@ async function executeAgentRound(
         agentMessageId: assistantMessageId,
         agentToolCallId: toolCallId,
         ...(options.agentBatchCallId ? { agentBatchCallId: options.agentBatchCallId } : {}),
+        ...(options.agentBatchItemId ? { agentBatchItemId: options.agentBatchItemId } : {}),
       }
 
       taskIdByToolCallId.set(toolCallId, task.id)
@@ -3840,6 +3906,7 @@ async function executeAgentRound(
           maskTargetImageId: null,
           maskImageId: null,
           ...(callId ? { agentBatchCallId: callId } : {}),
+          agentBatchItemId: item.id,
         })
         batchExecutionItems.push({ item, batchToolCallId, references, referenceIds, taskParams })
       }
@@ -3919,6 +3986,8 @@ async function executeAgentRound(
       for (let i = 0; i < batchItems.length; i++) {
         const settled = batchResults[i]
         const batchItem = batchItems[i]
+        const taskId = taskIdByToolCallId.get(batchExecutionItems[i].batchToolCallId)
+        if (!taskId || !useStore.getState().tasks.some((task) => task.id === taskId)) continue
         if (settled.status === 'fulfilled') {
           const r = settled.value
           if (r.image && !r.committed) continue
@@ -4023,12 +4092,15 @@ async function executeAgentRound(
       lastResponseId = result.responseId ?? lastResponseId
       currentResponseOutputItems = currentResponseOutputItems.length ? currentResponseOutputItems : result.outputItems ?? []
       const deletedTasks = getDeletedAgentTasks()
-      currentResponseOutputItems = scrubResponseOutputForDeletedAgentTasks(
-        round,
-        currentResponseOutputItems,
-        deletedTasks,
-        [...useStore.getState().tasks, ...deletedTasks],
-      )
+      const currentRound = getLatestRound()
+      if (currentRound) {
+        currentResponseOutputItems = scrubResponseOutputForDeletedAgentTasks(
+          currentRound,
+          currentResponseOutputItems,
+          deletedTasks,
+          [...useStore.getState().tasks, ...deletedTasks],
+        )
+      }
       accumulatedOutputItems = mergeResponseOutputItems(accumulatedOutputItems, currentResponseOutputItems)
       updateAgentConversation(conversationId, (current) => ({
         ...current,
@@ -4167,13 +4239,17 @@ async function executeAgentRound(
 
       const latestDeletedTasks = getDeletedAgentTasks()
       const cleanedConversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
-      const outputBeforeFunctionResults = cleanedConversation?.rounds.find((item) => item.id === roundId)?.responseOutput ?? accumulatedOutputItems
-      const accumulatedOutputItemsWithFunctionOutputs = scrubResponseOutputForDeletedAgentTasks(
-        round,
-        mergeResponseOutputItems(outputBeforeFunctionResults, functionCallOutputs),
-        latestDeletedTasks,
-        [...useStore.getState().tasks, ...latestDeletedTasks],
-      )
+      const latestRoundForCleanup = cleanedConversation?.rounds.find((item) => item.id === roundId)
+      const outputBeforeFunctionResults = latestRoundForCleanup?.responseOutput ?? accumulatedOutputItems
+      const mergedOutputItems = mergeResponseOutputItems(outputBeforeFunctionResults, functionCallOutputs)
+      const accumulatedOutputItemsWithFunctionOutputs = latestRoundForCleanup
+        ? scrubResponseOutputForDeletedAgentTasks(
+            latestRoundForCleanup,
+            mergedOutputItems,
+            latestDeletedTasks,
+            [...useStore.getState().tasks, ...latestDeletedTasks],
+          )
+        : mergedOutputItems
       const generatedOutputCallIds = new Set(functionCallOutputs.map((item) => item.call_id).filter(Boolean))
       const effectiveFunctionCallOutputs = accumulatedOutputItemsWithFunctionOutputs.filter(
         (item) => item.type === 'function_call_output' && item.call_id && generatedOutputCallIds.has(item.call_id),
@@ -4350,8 +4426,10 @@ async function executeAgentRound(
     }
     const deletedTasks = getDeletedActiveAgentTasks(conversationId, roundId, controller)
     try {
-      const updatedTasks = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
-      if (updatedTasks.length > 0) await commitTaskDeletion([], updatedTasks.map(getPersistableTask))
+      const cleanup = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
+      if (cleanup.updatedTasks.length > 0 || cleanup.updatedConversations.length > 0) {
+        await persistTaskDeletionCleanup([], cleanup)
+      }
     } catch (err) {
       console.warn('清理已删除 Agent 任务的响应失败', err)
     } finally {
@@ -4931,13 +5009,8 @@ async function removeTasks(taskIds: string[]) {
     clearOpenAIWatchdogTimer(task.id)
   }
 
-  const updatedTasks = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
-  try {
-    await commitTaskDeletion(deletedTasks.map((task) => task.id), updatedTasks.map(getPersistableTask))
-  } catch (err) {
-    console.warn('清理任务关联响应失败，继续删除目标任务', err)
-    for (const task of deletedTasks) await dbDeleteTask(task.id)
-  }
+  const cleanup = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
+  await persistTaskDeletionCleanup(deletedTasks.map((task) => task.id), cleanup)
   await deleteUnreferencedImageIds(deletedImageIds)
   return deletedTasks.length
 }
