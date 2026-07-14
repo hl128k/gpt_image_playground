@@ -2663,6 +2663,26 @@ function filterAgentRoundResponseOutputForInput(_round: AgentRound, _tasks: Task
   return output
 }
 
+function canonicalizeBatchFunctionCallArguments(output: ResponsesOutputItem[]) {
+  let changed = false
+  const canonical = output.map((item) => {
+    if (item.type !== 'function_call' || item.name !== 'generate_image_batch') return item
+    const batchItems = parseBatchImageCallArguments(item.arguments ?? '')
+    if (!batchItems) return item
+    try {
+      const parsed = JSON.parse(item.arguments ?? '{}')
+      if (!isRecord(parsed)) return item
+      const args = JSON.stringify({ ...parsed, images: batchItems })
+      if (args === item.arguments) return item
+      changed = true
+      return { ...item, arguments: args }
+    } catch {
+      return item
+    }
+  })
+  return changed ? canonical : output
+}
+
 function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: ResponsesOutputItem[], deletedTasks: TaskRecord[], roundTasks: TaskRecord[]) {
   const deletedTaskIds = new Set(deletedTasks.map((task) => task.id))
   const deletedToolCallIds = new Set(
@@ -2685,10 +2705,12 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
     if (batchItems) batchItemsByCallId.set(item.call_id, batchItems)
   }
   const deletedBatchItemIds = new Map<string, Set<string>>()
+  const batchTasksByCallId = new Map<string, TaskRecord[]>()
   for (const batchCallId of new Set(deletedTasks.map((task) => task.agentBatchCallId).filter((id): id is string => Boolean(id)))) {
     const batchTasks = round.outputTaskIds
       .map((taskId) => tasksById.get(taskId))
       .filter((task): task is TaskRecord => task?.agentBatchCallId === batchCallId)
+    batchTasksByCallId.set(batchCallId, batchTasks)
     if (batchTasks.length > 0 && batchTasks.every((task) => deletedTaskIds.has(task.id))) {
       removedFunctionCallIds.add(batchCallId)
       continue
@@ -2758,13 +2780,19 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
         scrubbed.push(item)
         continue
       }
-      const images = parsed.images.filter((image) => !isRecord(image) || typeof image.id !== 'string' || !itemIds.has(image.id))
-      if (images.length === parsed.images.length) {
+      const batchItems = batchItemsByCallId.get(callId)
+      const batchTasks = batchTasksByCallId.get(callId)
+      const canonicalImages = batchItems && batchTasks?.length === batchItems.length && parsed.images.length === batchItems.length
+        ? parsed.images.map((image, index) => isRecord(image) ? { ...image, id: batchItems[index].id } : image)
+        : parsed.images
+      const images = canonicalImages.filter((image) => !isRecord(image) || typeof image.id !== 'string' || !itemIds.has(image.id))
+      const value = JSON.stringify({ ...parsed, images })
+      if (value === item.output) {
         scrubbed.push(item)
         continue
       }
       changed = true
-      scrubbed.push({ ...item, output: JSON.stringify({ ...parsed, images }) })
+      scrubbed.push({ ...item, output: value })
     } catch {
       scrubbed.push(item)
     }
@@ -4068,10 +4096,10 @@ async function executeAgentRound(
         onOutputItems: shouldStreamAssistantMessage
           ? (outputItems) => {
               if (controller.signal.aborted) return
-              currentResponseOutputItems = outputItems
+              currentResponseOutputItems = canonicalizeBatchFunctionCallArguments(outputItems)
               updateAgentConversation(conversationId, (current) => ({
                 ...current,
-                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
+                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, currentResponseOutputItems) } : item),
               }))
             }
           : undefined,
@@ -4110,7 +4138,9 @@ async function executeAgentRound(
       if (controller.signal.aborted) throw createAgentAbortError()
 
       lastResponseId = result.responseId ?? lastResponseId
-      currentResponseOutputItems = currentResponseOutputItems.length ? currentResponseOutputItems : result.outputItems ?? []
+      currentResponseOutputItems = canonicalizeBatchFunctionCallArguments(
+        currentResponseOutputItems.length ? currentResponseOutputItems : result.outputItems ?? [],
+      )
       const deletedTasks = getDeletedAgentTasks()
       const currentRound = getLatestRound()
       if (currentRound) {
